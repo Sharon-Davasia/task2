@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+# ============================================================
+# Task 2: Victim-Attacker Interaction Duration Analysis
+# Kaggle Notebook-Style Single-File Pipeline
+# ============================================================
+# - Auto-discovers videos recursively in configured Kaggle input folders
+# - YOLOv8 + ByteTrack primary tracking
+# - Optional DeepSORT fallback (disabled by default)
+# - Pairwise interaction state machine
+# - Normalized distance + motion/suddenness scoring
+# - Temporal smoothing + track persistence
+# - Outputs per video:
+#     1) CSV reports
+#     2) Annotated video
+#     3) Timeline summary
+# - Optional GT evaluation if CSV exists (precision/recall/F1/etc.)
+#
+# Run in Kaggle with one cell after mounting datasets.
+# ============================================================
+
+import os
+import cv2
+import math
+import time
+import json
+import argparse
+import warnings
+from pathlib import Path
+from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ============================================================
+# CONFIG (ALL_CAPS)
+# ============================================================
+
+DATASET_ROOTS = [
+    "/kaggle/input/datasets/gauravsingh72509/non-snatching-datasets/normal",
+    "/kaggle/input/datasets/gauravsingh72509/snatching-datasets/snatching",
+    "/kaggle/input/datasets/kipshidze/shoplifting-video-dataset/normal",
+    "/kaggle/input/datasets/kipshidze/shoplifting-video-dataset/shoplifting",
+]
+
+OUTPUT_ROOT = "/kaggle/working/task2_outputs"
+
+VALID_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg", ".wmv", ".m4v"}
+
+GT_NAME_HINTS = [
+    "gt_events.csv",
+    "ground_truth.csv",
+    "annotations.csv",
+    "events.csv",
+]
+
+YOLO_MODEL = "yolov8n.pt"
+DET_CONF = 0.25
+USE_DEEPSORT_FALLBACK = False
+FALLBACK_MIN_TRACKS = 1
+
+NORM_MODE = "frame_height"
+PROXIMITY_THRESH = 0.12
+
+CLOSE_SMOOTHING_WINDOW = 5
+CLOSE_MAJORITY_RATIO = 0.6
+EVENT_END_GRACE_FRAMES = 4
+TRACK_PERSISTENCE_FRAMES = 12
+
+SUSPICIOUS_DURATION_SEC = 1.6
+MAX_INTERACTION_FOR_ABRUPT = 2.5
+APPROACH_SPEED_SUSPICIOUS = 0.08
+SEPARATION_SPEED_SUSPICIOUS = 0.08
+MOTION_ENERGY_SUSPICIOUS = 0.09
+SUSPICION_SCORE_THRESH = 0.62
+
+APPROACH_SPEED_REF = 0.12
+SEPARATION_SPEED_REF = 0.12
+MOTION_ENERGY_REF = 0.12
+W_APPROACH = 0.30
+W_SEPARATION = 0.30
+W_MOTION = 0.20
+W_SHORT_DURATION = 0.20
+
+EVENT_IOU_THRESH = 0.30
+
+DEFAULT_FPS_FALLBACK = 25.0
+ENABLE_POSE_HOOK = False
+DEMO_MODE = False
+DEMO_SECONDS = 10
+DEMO_FPS = 25
+DEMO_SIZE = (1280, 720)
+
+# memory safety
+MAX_FRAME_RECORDS = 20000
+
+# ============================================================
+# STEP-STYLE LOGGING
+# ============================================================
+
+def log_step(step: str, msg: str):
+    print(f"[{step}] {msg}")
+
+def log_info(msg: str):
+    print(f"[INFO] {msg}")
+
+def log_warn(msg: str):
+    print(f"[WARN] {msg}")
+
+def log_done(msg: str):
+    print(f"[DONE] {msg}")
+
+# ============================================================
+# Data structures
+# ============================================================
+
+@dataclass
+class TrackState:
+    track_id: int
+    center: Tuple[float, float]
+    bbox_xyxy: Tuple[float, float, float, float]
+    conf: float
+    frame_idx: int
+    timestamp_sec: float
+    velocity: Tuple[float, float] = (0.0, 0.0)
+    speed_norm: float = 0.0
+    missing_count: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=30))
+
+
+@dataclass
+class PairFrameRecord:
+    frame_idx: int
+    timestamp_sec: float
+    id_a: int
+    id_b: int
+    norm_dist: float
+    close_flag_raw: int
+    close_flag_smooth: int
+    rel_speed: float
+    approach_speed: float
+    separation_speed: float
+    pair_motion_energy: float
+    suspicion_score: float
+    label: str
+
+
+@dataclass
+class EventRecord:
+    event_id: int
+    id_a: int
+    id_b: int
+    start_frame: int
+    end_frame: int
+    start_time_sec: float
+    end_time_sec: float
+    duration_sec: float
+    avg_norm_dist: float
+    max_approach_speed: float
+    max_separation_speed: float
+    avg_motion_energy: float
+    max_suspicion_score: float
+    label: str
+    victim_id: Optional[int] = None
+    attacker_id: Optional[int] = None
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def safe_mkdir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def xyxy_to_center(xyxy: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = xyxy
+    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+
+def bbox_height(xyxy: Tuple[float, float, float, float]) -> float:
+    return max(1.0, float(xyxy[3] - xyxy[1]))
+
+def normalized_distance(
+    c1: Tuple[float, float],
+    c2: Tuple[float, float],
+    b1: Tuple[float, float, float, float],
+    b2: Tuple[float, float, float, float],
+    frame_h: int,
+    mode: str = "frame_height",
+) -> float:
+    d = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
+    if mode == "box_height":
+        denom = max(1.0, 0.5 * (bbox_height(b1) + bbox_height(b2)))
+    else:
+        denom = max(1.0, float(frame_h))
+    return d / denom
+
+def rolling_majority(flags: deque, min_positive: int) -> int:
+    if len(flags) == 0:
+        return 0
+    return 1 if sum(flags) >= min_positive else 0
+
+def iou_time_interval(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    union = max(a_end, b_end) - min(a_start, b_start)
+    return 0.0 if union <= 1e-9 else inter / union
+
+
+# ============================================================
+# Kaggle video discovery + GT discovery
+# ============================================================
+
+def discover_videos(dataset_roots: List[str], valid_exts: set) -> List[str]:
+    log_step("STEP 1", "Scanning configured dataset roots for videos recursively...")
+    videos = []
+    for root in dataset_roots:
+        if not os.path.exists(root):
+            log_warn(f"Dataset root not found: {root}")
+            continue
+        for p in Path(root).rglob("*"):
+            if p.is_file() and p.suffix.lower() in valid_exts:
+                videos.append(str(p))
+    videos = list(set(videos))
+    videos = sorted(videos)
+    log_info(f"Discovered {len(videos)} unique video file(s).")
+    return videos
+
+def find_possible_gt_csv(video_path: str) -> Optional[str]:
+    vp = Path(video_path)
+    stem = vp.stem
+    same_dir = vp.parent
+    parent_dir = vp.parent.parent if vp.parent.parent != vp.parent else vp.parent
+
+    stem_csv = same_dir / f"{stem}.csv"
+    if stem_csv.exists():
+        return str(stem_csv)
+
+    for hint in GT_NAME_HINTS:
+        c1 = same_dir / hint
+        c2 = parent_dir / hint
+        if c1.exists():
+            return str(c1)
+        if c2.exists():
+            return str(c2)
+
+    for base in [same_dir, parent_dir]:
+        if not base.exists():
+            continue
+        candidates = []
+        for p in base.rglob("*.csv"):
+            name = p.name.lower()
+            if stem.lower() in name or ("event" in name) or ("gt" in name):
+                candidates.append(p)
+        if candidates:
+            candidates = sorted(candidates, key=lambda x: (0 if x.stem.lower() == stem.lower() else 1, len(str(x))))
+            return str(candidates[0])
+
+    return None
+
+
+# ============================================================
+# Optional synthetic demo generator
+# ============================================================
+
+def generate_demo_video(path: str, fps: int = DEMO_FPS, seconds: int = DEMO_SECONDS, size: Tuple[int, int] = DEMO_SIZE):
+    w, h = size
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(path, fourcc, fps, (w, h))
+    total = fps * seconds
+
+    A = np.array([140.0, 390.0])
+    B = np.array([670.0, 390.0])
+    C = np.array([320.0, 580.0])
+    D = np.array([390.0, 580.0])
+
+    for f in range(total):
+        img = np.full((h, w, 3), 25, dtype=np.uint8)
+        for gx in range(0, w, 80):
+            cv2.line(img, (gx, 0), (gx, h), (38, 38, 38), 1)
+        for gy in range(0, h, 80):
+            cv2.line(img, (0, gy), (w, gy), (38, 38, 38), 1)
+
+        t = f / fps
+
+        if t < 4:
+            A[0] += 1.2
+            B[0] += 0.4
+        elif 4 <= t < 5.0:
+            A[0] += 7.0
+            B[0] += 0.2
+        elif 5.0 <= t < 6.0:
+            A[0] -= 6.5
+            B[0] += 0.8
+        else:
+            A[0] += 0.3
+            B[0] += 0.4
+
+        A[1] += math.sin(t * 3.1) * 0.8
+        B[1] += math.cos(t * 2.5) * 0.6
+        C[0] += 0.8
+        D[0] += 0.8
+
+        actors = [("A", A, (0, 0, 255)), ("B", B, (0, 255, 255)), ("C", C, (255, 0, 0)), ("D", D, (0, 255, 0))]
+        for name, pos, color in actors:
+            x, y = int(pos[0]), int(pos[1])
+            bw, bh = 42, 120
+            x1, y1, x2, y2 = x - bw // 2, y - bh, x + bw // 2, y
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(img, name, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        out.write(img)
+
+    out.release()
+
+
+# ============================================================
+# YOLO + tracking wrapper
+# ============================================================
+
+class TrackerWrapper:
+    def __init__(self, use_deepsort_fallback: bool = False):
+        self.use_deepsort_fallback = use_deepsort_fallback
+        self.yolo_model = None
+        self.deepsort = None
+        self.deepsort_initialized = False
+        self.last_tracker_mode = "bytetrack"
+
+    def load_yolo(self, model_path: str = YOLO_MODEL):
+        from ultralytics import YOLO
+        self.yolo_model = YOLO(model_path)
+
+    def init_deepsort(self):
+        if self.deepsort_initialized:
+            return
+        try:
+            from deep_sort_realtime.deepsort_tracker import DeepSort
+            self.deepsort = DeepSort(max_age=20, n_init=2, max_cosine_distance=0.4)
+            self.deepsort_initialized = True
+            log_info("DeepSORT initialized.")
+        except Exception as e:
+            self.deepsort = None
+            self.deepsort_initialized = False
+            log_warn(f"DeepSORT unavailable: {e}")
+
+    def track_bytetrack(self, frame: np.ndarray, conf_thresh: float = DET_CONF):
+        if self.yolo_model is None:
+            raise RuntimeError("YOLO model not loaded.")
+        res = self.yolo_model.track(
+            source=frame,
+            persist=True,
+            classes=[0],
+            conf=conf_thresh,
+            tracker="bytetrack.yaml",
+            verbose=False
+        )
+        out_tracks = []
+        if len(res) == 0:
+            return out_tracks
+        r = res[0]
+        if r.boxes is None or r.boxes.id is None:
+            return out_tracks
+
+        ids = r.boxes.id.cpu().numpy().astype(int)
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+
+        for i, tid in enumerate(ids):
+            x1, y1, x2, y2 = xyxy[i].tolist()
+            out_tracks.append({
+                "track_id": int(tid),
+                "bbox": (float(x1), float(y1), float(x2), float(y2)),
+                "conf": float(confs[i]),
+            })
+        self.last_tracker_mode = "bytetrack"
+        return out_tracks
+
+    def detect_yolo(self, frame: np.ndarray, conf_thresh: float = DET_CONF):
+        if self.yolo_model is None:
+            raise RuntimeError("YOLO model not loaded.")
+        res = self.yolo_model.predict(source=frame, classes=[0], conf=conf_thresh, verbose=False)
+        out = []
+        if len(res) == 0:
+            return out
+        r = res[0]
+        if r.boxes is None:
+            return out
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        for i in range(len(xyxy)):
+            x1, y1, x2, y2 = xyxy[i].tolist()
+            out.append(((float(x1), float(y1), float(x2), float(y2)), float(confs[i])))
+        return out
+
+    def track_deepsort(self, frame: np.ndarray, conf_thresh: float = DET_CONF):
+        self.init_deepsort()
+        if not self.deepsort_initialized or self.deepsort is None:
+            return []
+        dets = self.detect_yolo(frame, conf_thresh)
+        ds_in = []
+        for (x1, y1, x2, y2), conf in dets:
+            w, h = x2 - x1, y2 - y1
+            ds_in.append(([x1, y1, w, h], conf, "person"))
+        tracks = self.deepsort.update_tracks(ds_in, frame=frame)
+
+        out_tracks = []
+        for tr in tracks:
+            if not tr.is_confirmed():
+                continue
+            tid = tr.track_id
+            ltrb = tr.to_ltrb()
+            x1, y1, x2, y2 = map(float, ltrb)
+            out_tracks.append({
+                "track_id": int(tid),
+                "bbox": (x1, y1, x2, y2),
+                "conf": 0.50,
+            })
+        self.last_tracker_mode = "deepsort"
+        return out_tracks
+
+    def track(self, frame: np.ndarray, conf_thresh: float = DET_CONF, fallback_min_tracks: int = FALLBACK_MIN_TRACKS):
+        bt = self.track_bytetrack(frame, conf_thresh)
+        if self.use_deepsort_fallback and len(bt) < fallback_min_tracks:
+            ds = self.track_deepsort(frame, conf_thresh)
+            if len(ds) > len(bt):
+                return ds
+        return bt
+
+
+# ============================================================
+# Interaction analyzer
+# ============================================================
+
+class InteractionAnalyzer:
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.tracks: Dict[int, TrackState] = {}
+        self.frame_pair_records: List[PairFrameRecord] = []
+        self.events: List[EventRecord] = []
+        self.active_pair_state: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self.pair_close_history: Dict[Tuple[int, int], deque] = defaultdict(
+            lambda: deque(maxlen=CLOSE_SMOOTHING_WINDOW)
+        )
+        self.next_event_id = 1
+        self.last_pair_dist: Dict[Tuple[int, int], float] = {}
+
+    def assign_roles_for_event(self, pair_hist: List[PairFrameRecord]) -> Tuple[int, int]:
+        ida, idb = pair_hist[0].id_a, pair_hist[0].id_b
+        if len(pair_hist) < 2:
+            return ida, idb
+
+        peak_idx = int(np.argmax([p.suspicion_score for p in pair_hist]))
+        s0 = max(0, peak_idx - 2)
+        s1 = min(len(pair_hist), peak_idx + 3)
+        mean_energy = np.mean([p.pair_motion_energy for p in pair_hist[s0:s1]]) if s1 > s0 else 0.0
+
+        if mean_energy >= MOTION_ENERGY_SUSPICIOUS:
+            attacker = min(ida, idb)
+            victim = max(ida, idb)
+        else:
+            attacker = ida
+            victim = idb
+        return victim, attacker
+
+    def update_track_states(self, curr_tracks: List[Dict[str, Any]], frame_idx: int, ts: float, frame_shape):
+        H, W = frame_shape[:2]
+        seen = set()
+
+        for tr in curr_tracks:
+            tid = tr["track_id"]
+            box = tr["bbox"]
+            conf = tr["conf"]
+            c = xyxy_to_center(box)
+            seen.add(tid)
+
+            if tid not in self.tracks:
+                self.tracks[tid] = TrackState(
+                    track_id=tid,
+                    center=c,
+                    bbox_xyxy=box,
+                    conf=conf,
+                    frame_idx=frame_idx,
+                    timestamp_sec=ts,
+                )
+            else:
+                prev = self.tracks[tid]
+                dt = max(1e-6, ts - prev.timestamp_sec)
+                vx = (c[0] - prev.center[0]) / dt
+                vy = (c[1] - prev.center[1]) / dt
+                speed_norm = math.hypot(vx, vy) / max(1.0, H)
+
+                prev.velocity = (vx, vy)
+                prev.speed_norm = speed_norm
+                prev.center = c
+                prev.bbox_xyxy = box
+                prev.conf = conf
+                prev.frame_idx = frame_idx
+                prev.timestamp_sec = ts
+                prev.missing_count = 0
+                prev.history.append((frame_idx, c, box, speed_norm))
+
+        for tid in list(self.tracks.keys()):
+            if tid not in seen:
+                self.tracks[tid].missing_count += 1
+                if self.tracks[tid].missing_count > TRACK_PERSISTENCE_FRAMES:
+                    del self.tracks[tid]
+
+    def analyze_frame_pairs(self, frame_idx: int, ts: float, frame_h: int):
+        visible_ids = [tid for tid, st in self.tracks.items() if st.missing_count <= TRACK_PERSISTENCE_FRAMES]
+        visible_ids.sort()
+
+        for i in range(len(visible_ids)):
+            for j in range(i + 1, len(visible_ids)):
+                ida, idb = visible_ids[i], visible_ids[j]
+                ta, tb = self.tracks[ida], self.tracks[idb]
+
+                nd = normalized_distance(ta.center, tb.center, ta.bbox_xyxy, tb.bbox_xyxy, frame_h, mode=NORM_MODE)
+                self.last_pair_dist[(ida, idb)] = nd
+                close_raw = 1 if nd < PROXIMITY_THRESH else 0
+
+                key = (ida, idb)
+                self.pair_close_history[key].append(close_raw)
+                min_pos = max(1, int(round(len(self.pair_close_history[key]) * CLOSE_MAJORITY_RATIO)))
+                close_smooth = rolling_majority(self.pair_close_history[key], min_pos)
+
+                rvx = ta.velocity[0] - tb.velocity[0]
+                rvy = ta.velocity[1] - tb.velocity[1]
+                rel_speed = math.hypot(rvx, rvy) / max(1.0, frame_h)
+
+                prev_nd = self.last_pair_dist.get((ida, idb), None)
+
+                approach, separation = 0.0, 0.0
+                if prev_nd is not None:
+                    delta = nd - prev_nd
+                    approach = max(0.0, -delta * self.fps)
+                    separation = max(0.0, delta * self.fps)
+
+                motion_energy = 0.5 * (ta.speed_norm + tb.speed_norm) + 0.5 * rel_speed
+
+                active = self.active_pair_state.get(key, None)
+                cur_dur = 0.0
+                if active and active.get("is_active", False):
+                    cur_dur = ts - active["start_time_sec"]
+
+                duration_shortness = 1.0 - clamp(cur_dur / max(1e-6, SUSPICIOUS_DURATION_SEC), 0.0, 1.0)
+                score = (
+                    W_APPROACH * clamp(approach / APPROACH_SPEED_REF, 0, 1)
+                    + W_SEPARATION * clamp(separation / SEPARATION_SPEED_REF, 0, 1)
+                    + W_MOTION * clamp(motion_energy / MOTION_ENERGY_REF, 0, 1)
+                    + W_SHORT_DURATION * duration_shortness
+                )
+                score = clamp(score, 0.0, 1.0)
+
+                label = "none"
+                self._update_event_state(
+                    key=key, ida=ida, idb=idb, frame_idx=frame_idx, ts=ts,
+                    nd=nd, close_smooth=close_smooth, approach=approach,
+                    separation=separation, motion_energy=motion_energy, suspicion_score=score
+                )
+                st = self.active_pair_state.get(key, None)
+                if st and st.get("is_active", False):
+                    label = st.get("current_label", "none")
+
+                self.frame_pair_records.append(
+                    PairFrameRecord(
+                        frame_idx=frame_idx,
+                        timestamp_sec=ts,
+                        id_a=ida,
+                        id_b=idb,
+                        norm_dist=nd,
+                        close_flag_raw=close_raw,
+                        close_flag_smooth=close_smooth,
+                        rel_speed=rel_speed,
+                        approach_speed=approach,
+                        separation_speed=separation,
+                        pair_motion_energy=motion_energy,
+                        suspicion_score=score,
+                        label=label
+                    )
+                )
+                if len(self.frame_pair_records) > MAX_FRAME_RECORDS:
+                    self.frame_pair_records = self.frame_pair_records[-MAX_FRAME_RECORDS:]
+
+    def _update_event_state(self, key, ida, idb, frame_idx, ts, nd, close_smooth, approach, separation, motion_energy, suspicion_score):
+        st = self.active_pair_state.get(key)
+        if st is None:
+            st = {
+                "is_active": False,
+                "start_frame": None,
+                "start_time_sec": None,
+                "last_frame": None,
+                "last_time_sec": None,
+                "records": [],
+                "current_label": "none",
+                "inactive_grace": 0,
+            }
+            self.active_pair_state[key] = st
+
+        if close_smooth == 1:
+            if not st["is_active"]:
+                st["is_active"] = True
+                st["start_frame"] = frame_idx
+                st["start_time_sec"] = ts
+                st["records"] = []
+                st["inactive_grace"] = 0
+
+            st["last_frame"] = frame_idx
+            st["last_time_sec"] = ts
+            st["records"].append((frame_idx, ts, nd, approach, separation, motion_energy, suspicion_score))
+
+            dur = ts - st["start_time_sec"]
+            suspicious = (
+                (dur <= SUSPICIOUS_DURATION_SEC and suspicion_score >= SUSPICION_SCORE_THRESH)
+                or (approach >= APPROACH_SPEED_SUSPICIOUS and separation >= SEPARATION_SPEED_SUSPICIOUS)
+                or (motion_energy >= MOTION_ENERGY_SUSPICIOUS and dur <= MAX_INTERACTION_FOR_ABRUPT)
+            )
+            st["current_label"] = "suspicious" if suspicious else "normal"
+            st["inactive_grace"] = 0
+        else:
+            if st["is_active"]:
+                st["inactive_grace"] += 1
+                if st["inactive_grace"] > EVENT_END_GRACE_FRAMES:
+                    self._finalize_event(key)
+
+    def _finalize_event(self, key):
+        st = self.active_pair_state[key]
+        if not st["is_active"] or len(st["records"]) == 0:
+            st["is_active"] = False
+            return
+
+        arr = np.array(st["records"], dtype=float)
+        sframe, eframe = int(arr[0, 0]), int(arr[-1, 0])
+        stime, etime = float(arr[0, 1]), float(arr[-1, 1])
+        dur = max(0.0, etime - stime)
+        avg_d = float(np.mean(arr[:, 2]))
+        max_app = float(np.max(arr[:, 3]))
+        max_sep = float(np.max(arr[:, 4]))
+        avg_me = float(np.mean(arr[:, 5]))
+        max_sc = float(np.max(arr[:, 6]))
+
+        ida, idb = key
+        pair_hist = [p for p in self.frame_pair_records if p.id_a == ida and p.id_b == idb and sframe <= p.frame_idx <= eframe]
+        if not pair_hist:
+            pair_hist = [PairFrameRecord(sframe, stime, ida, idb, avg_d, 1, 1, 0.0, max_app, max_sep, avg_me, max_sc, st["current_label"])]
+
+        victim_id, attacker_id = self.assign_roles_for_event(pair_hist)
+
+        ev = EventRecord(
+            event_id=self.next_event_id,
+            id_a=ida, id_b=idb,
+            start_frame=sframe, end_frame=eframe,
+            start_time_sec=stime, end_time_sec=etime,
+            duration_sec=dur,
+            avg_norm_dist=avg_d,
+            max_approach_speed=max_app,
+            max_separation_speed=max_sep,
+            avg_motion_energy=avg_me,
+            max_suspicion_score=max_sc,
+            label=st["current_label"],
+            victim_id=victim_id,
+            attacker_id=attacker_id,
+        )
+        self.events.append(ev)
+        self.next_event_id += 1
+
+        st["is_active"] = False
+        st["start_frame"] = None
+        st["start_time_sec"] = None
+        st["last_frame"] = None
+        st["last_time_sec"] = None
+        st["records"] = []
+        st["current_label"] = "none"
+        st["inactive_grace"] = 0
+
+    def finalize_all(self):
+        for k in list(self.active_pair_state.keys()):
+            if self.active_pair_state[k]["is_active"]:
+                self._finalize_event(k)
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+def load_gt_events(gt_csv: str) -> pd.DataFrame:
+    df = pd.read_csv(gt_csv)
+    required = {"event_id", "start_time_sec", "end_time_sec"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"GT CSV missing required columns: {missing}")
+    return df
+
+def evaluate_events(pred_df: pd.DataFrame, gt_df: pd.DataFrame, iou_thresh: float = EVENT_IOU_THRESH) -> Dict[str, float]:
+    if len(gt_df) == 0 and len(pred_df) == 0:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "event_accuracy": 1.0, "duration_mae_sec": 0.0}
+    if len(pred_df) == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "event_accuracy": 0.0, "duration_mae_sec": float("inf")}
+    if len(gt_df) == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "event_accuracy": 0.0, "duration_mae_sec": float("inf")}
+
+    matched_gt = set()
+    matched_pred = set()
+    duration_errors = []
+
+    for pi, prow in pred_df.iterrows():
+        p0, p1 = float(prow["start_time_sec"]), float(prow["end_time_sec"])
+        best_j, best_iou = None, 0.0
+        for gj, grow in gt_df.iterrows():
+            if gj in matched_gt:
+                continue
+            g0, g1 = float(grow["start_time_sec"]), float(grow["end_time_sec"])
+            iou = iou_time_interval(p0, p1, g0, g1)
+            if iou > best_iou:
+                best_iou = iou
+                best_j = gj
+        if best_j is not None and best_iou >= iou_thresh:
+            if str(prow.get("event_label", "")) != str(gt_df.loc[best_j].get("event_label", "")):
+                continue
+            matched_pred.add(pi)
+            matched_gt.add(best_j)
+            pred_dur = p1 - p0
+            gt_dur = float(gt_df.loc[best_j, "end_time_sec"] - gt_df.loc[best_j, "start_time_sec"])
+            duration_errors.append(abs(pred_dur - gt_dur))
+
+    tp = len(matched_pred)
+    fp = len(pred_df) - tp
+    fn = len(gt_df) - tp
+
+    precision = tp / (tp + fp + 1e-9)
+    recall = tp / (tp + fn + 1e-9)
+    f1 = 2 * precision * recall / (precision + recall + 1e-9)
+    event_accuracy = tp / (tp + fp + fn + 1e-9)
+    duration_mae = float(np.mean(duration_errors)) if duration_errors else float("inf")
+
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "event_accuracy": float(event_accuracy),
+        "duration_mae_sec": float(duration_mae),
+    }
+
+
+# ============================================================
+# Per-video Task 2 pipeline
+# ============================================================
+
+def get_pair_state_for_track(track_id, records_now, analyzer):
+    """
+    Return the strongest active pair state involving this track in the current frame.
+    """
+    best = None
+    best_score = -1
+
+    for r in records_now:
+        if r.id_a == track_id or r.id_b == track_id:
+            if r.suspicion_score > best_score:
+                best_score = r.suspicion_score
+                best = r
+
+    return best
+
+def process_single_video(
+    video_path: str,
+    tracker: TrackerWrapper,
+    out_root: str,
+    gt_csv: Optional[str] = None
+) -> Dict[str, Any]:
+    video_path = str(video_path)
+    vp = Path(video_path)
+    safe_name = vp.stem.replace(" ", "_")
+    video_out_dir = os.path.join(out_root, safe_name)
+    safe_mkdir(video_out_dir)
+
+    log_step("STEP 3", f"Processing video: {video_path}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        log_warn(f"Failed to open video: {video_path}")
+        return {"video": video_path, "status": "failed_open"}
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = float(src_fps if src_fps and src_fps > 1e-3 else DEFAULT_FPS_FALLBACK)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+
+    if duration_sec < 3.0:
+        log_warn(f"Skipping short video ({duration_sec:.1f}s): {video_path}")
+        cap.release()
+        return {"video": video_path, "status": "skipped_duration"}
+
+    if height < 240:
+        log_warn(f"Skipping low resolution ({height}p): {video_path}")
+        cap.release()
+        return {"video": video_path, "status": "skipped_resolution"}
+
+    total = total_frames
+
+    analyzer = InteractionAnalyzer(fps=fps)
+
+    out_video = os.path.join(video_out_dir, f"{safe_name}_annotated.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_video, fourcc, fps, (width, height))
+
+    frame_idx = 0
+    t0 = time.time()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        ts = frame_idx / fps
+        tracks = tracker.track(frame, conf_thresh=DET_CONF, fallback_min_tracks=FALLBACK_MIN_TRACKS)
+
+        analyzer.update_track_states(tracks, frame_idx, ts, frame.shape)
+        analyzer.analyze_frame_pairs(frame_idx, ts, height)
+
+        rec_now = [r for r in analyzer.frame_pair_records if r.frame_idx == frame_idx]
+
+        for tr in tracks:
+            tid = tr["track_id"]
+            x1, y1, x2, y2 = map(int, tr["bbox"])
+
+            pair_state = get_pair_state_for_track(tid, rec_now, analyzer)
+
+            if pair_state is None:
+                box_color = (80, 220, 80)   # green = no interaction
+                label_text = f"ID:{tid}"
+                text_color = (80, 220, 80)
+            else:
+                if pair_state.label == "suspicious":
+                    box_color = (0, 0, 255)     # red = suspicious
+                    label_text = f"ID:{tid} SUSP"
+                    text_color = (0, 0, 255)
+                elif pair_state.label == "normal":
+                    box_color = (255, 215, 0)   # yellow = normal interaction
+                    label_text = f"ID:{tid} NORMAL"
+                    text_color = (255, 215, 0)
+                else:
+                    box_color = (200, 200, 200)
+                    label_text = f"ID:{tid}"
+                    text_color = (200, 200, 200)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 3)
+            cv2.putText(frame, label_text, (x1, max(18, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 2)
+
+        for r in rec_now[:8]:
+            if r.label in ("suspicious", "normal"):
+                t1 = next((t for t in tracks if t["track_id"] == r.id_a), None)
+                t2 = next((t for t in tracks if t["track_id"] == r.id_b), None)
+                if t1 is not None and t2 is not None:
+                    c1 = tuple(map(int, xyxy_to_center(t1["bbox"])))
+                    c2 = tuple(map(int, xyxy_to_center(t2["bbox"])))
+                    color = (0, 0, 255) if r.label == "suspicious" else (255, 215, 0)
+
+                    cv2.line(frame, c1, c2, color, 2)
+                    mid = ((c1[0] + c2[0]) // 2, (c1[1] + c2[1]) // 2)
+                    cv2.putText(frame, r.label.upper(), mid,
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+        y0 = 24
+        for k, r in enumerate(rec_now[:8]):
+            txt = f"Pair({r.id_a},{r.id_b}) d={r.norm_dist:.3f} close={r.close_flag_smooth} sc={r.suspicion_score:.2f} {r.label}"
+            color = (0, 0, 255) if r.label == "suspicious" else (0, 255, 255) if r.label == "normal" else (200, 200, 200)
+            cv2.putText(frame, txt, (10, y0 + 22 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+
+        cv2.putText(frame, f"Tracker:{tracker.last_tracker_mode}", (10, height - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 180, 50), 2)
+        cv2.putText(frame, f"Frame:{frame_idx}/{total}", (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 180, 50), 2)
+
+        writer.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+    analyzer.finalize_all()
+
+    frame_rows = []
+    for r in analyzer.frame_pair_records:
+        frame_rows.append({
+            "frame_idx": r.frame_idx,
+            "timestamp_sec": r.timestamp_sec,
+            "track_id_a": r.id_a,
+            "track_id_b": r.id_b,
+            "normalized_distance": r.norm_dist,
+            "close_flag_raw": r.close_flag_raw,
+            "close_flag_smooth": r.close_flag_smooth,
+            "relative_speed": r.rel_speed,
+            "approach_speed": r.approach_speed,
+            "separation_speed": r.separation_speed,
+            "motion_energy": r.pair_motion_energy,
+            "suspicion_score": r.suspicion_score,
+            "frame_label": r.label
+        })
+    frame_df = pd.DataFrame(frame_rows)
+
+    event_rows = []
+    for e in analyzer.events:
+        event_rows.append({
+            "event_id": e.event_id,
+            "track_id_a": e.id_a,
+            "track_id_b": e.id_b,
+            "victim_id": e.victim_id,
+            "attacker_id": e.attacker_id,
+            "start_frame": e.start_frame,
+            "end_frame": e.end_frame,
+            "start_time_sec": e.start_time_sec,
+            "end_time_sec": e.end_time_sec,
+            "duration_sec": e.duration_sec,
+            "avg_normalized_distance": e.avg_norm_dist,
+            "max_approach_speed": e.max_approach_speed,
+            "max_separation_speed": e.max_separation_speed,
+            "avg_motion_energy": e.avg_motion_energy,
+            "max_suspicion_score": e.max_suspicion_score,
+            "event_label": e.label
+        })
+    events_df = pd.DataFrame(event_rows)
+
+    frame_csv = os.path.join(video_out_dir, f"{safe_name}_interaction_frame_report.csv")
+    event_csv = os.path.join(video_out_dir, f"{safe_name}_interaction_event_report.csv")
+    frame_df.to_csv(frame_csv, index=False)
+    events_df.to_csv(event_csv, index=False)
+
+    timeline_txt = os.path.join(video_out_dir, f"{safe_name}_timeline_summary.txt")
+    with open(timeline_txt, "w", encoding="utf-8") as f:
+        f.write("Victim-Attacker Interaction Duration Analysis - Timeline\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"video_path: {video_path}\n")
+        f.write(f"fps: {fps:.4f}\n")
+        f.write(f"processed_frames: {frame_idx}\n")
+        f.write(f"annotated_video: {out_video}\n")
+        f.write(f"frame_csv: {frame_csv}\n")
+        f.write(f"event_csv: {event_csv}\n\n")
+        if len(events_df) == 0:
+            f.write("No interaction events detected.\n")
+        else:
+            for _, row in events_df.iterrows():
+                f.write(
+                    f"Event {int(row['event_id'])}: Pair({int(row['track_id_a'])},{int(row['track_id_b'])}) "
+                    f"Victim={int(row['victim_id']) if not pd.isna(row['victim_id']) else 'NA'} "
+                    f"Attacker={int(row['attacker_id']) if not pd.isna(row['attacker_id']) else 'NA'} | "
+                    f"{row['start_time_sec']:.2f}s -> {row['end_time_sec']:.2f}s | "
+                    f"dur={row['duration_sec']:.2f}s | label={row['event_label']} | "
+                    f"score={row['max_suspicion_score']:.2f}\n"
+                )
+
+    metrics = {
+        "precision": np.nan,
+        "recall": np.nan,
+        "f1": np.nan,
+        "event_accuracy": np.nan,
+        "duration_mae_sec": np.nan,
+        "gt_csv_used": None
+    }
+    if gt_csv and os.path.exists(gt_csv):
+        try:
+            gt_df = load_gt_events(gt_csv)
+            ev_metrics = evaluate_events(events_df, gt_df, iou_thresh=EVENT_IOU_THRESH)
+            metrics.update(ev_metrics)
+            metrics["gt_csv_used"] = gt_csv
+            log_info(f"GT metrics computed for: {video_path}")
+        except Exception as e:
+            log_warn(f"GT evaluation skipped for {video_path}: {e}")
+
+    metrics_json = os.path.join(video_out_dir, f"{safe_name}_metrics_summary.json")
+    with open(metrics_json, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    elapsed = time.time() - t0
+    log_done(f"{vp.name} processed in {elapsed:.2f}s | events={len(events_df)}")
+
+    return {
+        "video": video_path,
+        "status": "ok",
+        "output_dir": video_out_dir,
+        "annotated_video": out_video,
+        "frame_csv": frame_csv,
+        "event_csv": event_csv,
+        "timeline_txt": timeline_txt,
+        "metrics_json": metrics_json,
+        "num_events": int(len(events_df)),
+        "num_frame_records": int(len(frame_df)),
+        "elapsed_sec": float(elapsed),
+        "gt_csv": gt_csv if gt_csv else None,
+    }
+
+
+# ============================================================
+# Batch driver
+# ============================================================
+
+def run_batch_pipeline(dataset_roots: List[str], output_root: str):
+    log_step("STEP 0", "Initializing Task 2 batch pipeline...")
+    safe_mkdir(output_root)
+
+    global W_APPROACH, W_SEPARATION, W_MOTION, W_SHORT_DURATION
+    wsum = W_APPROACH + W_SEPARATION + W_MOTION + W_SHORT_DURATION
+    if wsum <= 1e-9:
+        W_APPROACH, W_SEPARATION, W_MOTION, W_SHORT_DURATION = 0.3, 0.3, 0.2, 0.2
+    else:
+        W_APPROACH /= wsum
+        W_SEPARATION /= wsum
+        W_MOTION /= wsum
+        W_SHORT_DURATION /= wsum
+
+    if ENABLE_POSE_HOOK:
+        log_info("Pose hook enabled (placeholder): integrate keypoint-based distance features here.")
+
+    if DEMO_MODE:
+        log_step("STEP DEMO", "Generating optional demo video...")
+        demo_dir = os.path.join(output_root, "_demo")
+        safe_mkdir(demo_dir)
+        demo_path = os.path.join(demo_dir, "demo_video.mp4")
+        generate_demo_video(demo_path)
+
+    videos = discover_videos(dataset_roots, VALID_VIDEO_EXTS)
+    if DEMO_MODE:
+        demo_path = os.path.join(output_root, "_demo", "demo_video.mp4")
+        videos.append(demo_path)
+
+    videos = list(set(videos))
+    videos = sorted(videos)
+
+    if len(videos) == 0:
+        log_warn("No valid videos found. Check DATASET_ROOTS and dataset mount paths.")
+        return
+
+    log_step("STEP 2", f"Loading YOLO model: {YOLO_MODEL}")
+    tracker = TrackerWrapper(use_deepsort_fallback=USE_DEEPSORT_FALLBACK)
+    tracker.load_yolo(YOLO_MODEL)
+    log_done("YOLO loaded and tracker initialized.")
+
+    log_step("STEP 4", f"Running batch processing on {len(videos)} video(s)...")
+    all_results = []
+    for idx, vid in enumerate(videos, start=1):
+        log_info(f"({idx}/{len(videos)}) {vid}")
+        gt_csv = find_possible_gt_csv(vid)
+        if gt_csv:
+            log_info(f"Potential GT CSV found: {gt_csv}")
+        res = process_single_video(vid, tracker, output_root, gt_csv=gt_csv)
+        all_results.append(res)
+
+    all_metrics = []
+
+    for r in all_results:
+        if r.get("metrics_json") and os.path.exists(r["metrics_json"]):
+            with open(r["metrics_json"]) as f:
+                m = json.load(f)
+                if not np.isnan(m.get("f1", np.nan)):
+                    all_metrics.append(m)
+
+    if all_metrics:
+        dfm = pd.DataFrame(all_metrics)
+        global_metrics = {
+            "precision": dfm["precision"].mean(),
+            "recall": dfm["recall"].mean(),
+            "f1": dfm["f1"].mean(),
+            "event_accuracy": dfm["event_accuracy"].mean(),
+            "duration_mae_sec": dfm["duration_mae_sec"].mean(),
+        }
+
+        with open(os.path.join(output_root, "global_metrics.json"), "w") as f:
+            json.dump(global_metrics, f, indent=2)
+
+    summary_rows = []
+    for r in all_results:
+        summary_rows.append({
+            "video": r.get("video"),
+            "status": r.get("status"),
+            "output_dir": r.get("output_dir"),
+            "annotated_video": r.get("annotated_video"),
+            "frame_csv": r.get("frame_csv"),
+            "event_csv": r.get("event_csv"),
+            "timeline_txt": r.get("timeline_txt"),
+            "metrics_json": r.get("metrics_json"),
+            "num_events": r.get("num_events"),
+            "num_frame_records": r.get("num_frame_records"),
+            "elapsed_sec": r.get("elapsed_sec"),
+            "gt_csv": r.get("gt_csv"),
+        })
+    batch_df = pd.DataFrame(summary_rows)
+    batch_csv = os.path.join(output_root, "batch_run_summary.csv")
+    batch_df.to_csv(batch_csv, index=False)
+
+    summary_txt = os.path.join(output_root, "batch_run_summary.txt")
+    with open(summary_txt, "w", encoding="utf-8") as f:
+        f.write("Task 2 Batch Run Summary\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"dataset_roots: {dataset_roots}\n")
+        f.write(f"total_videos_discovered: {len(videos)}\n")
+        f.write(f"output_root: {output_root}\n")
+        f.write(f"batch_csv: {batch_csv}\n\n")
+        for _, row in batch_df.iterrows():
+            f.write(
+                f"- {row['video']} | status={row['status']} | events={row.get('num_events', 'NA')} | "
+                f"time={row.get('elapsed_sec', 'NA')}\n"
+            )
+
+    log_done(f"Batch processing complete. Summary CSV: {batch_csv}")
+    log_done(f"Summary TXT: {summary_txt}")
+
+
+# ============================================================
+# Optional CLI wrapper (still notebook-friendly)
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Task 2 Kaggle Batch Pipeline")
+    parser.add_argument("--dataset_roots", type=str, nargs="*", default=None, help="Override dataset roots")
+    parser.add_argument("--output_root", type=str, default=OUTPUT_ROOT, help="Output root path")
+    parser.add_argument("--demo_mode", action="store_true", help="Enable demo mode")
+    args, _ = parser.parse_known_args()
+    return args
+
+def main():
+    args = parse_args()
+
+    dataset_roots = args.dataset_roots if args.dataset_roots else DATASET_ROOTS
+    output_root = args.output_root
+
+    global DEMO_MODE
+    DEMO_MODE = DEMO_MODE or args.demo_mode
+
+    run_batch_pipeline(dataset_roots=dataset_roots, output_root=output_root)
+
+
+if __name__ == "__main__":
+    main()
